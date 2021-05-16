@@ -1,17 +1,11 @@
 from __future__ import print_function
-
-# diff 
 import torch
 import torch.nn.functional as F
-
-# train
 import argparse
-import os
 import random
 import torch
 import torch.nn as nn
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
 import torchvision.datasets as dset
@@ -19,35 +13,15 @@ import torchvision.transforms as transforms
 import torchvision.utils as vutils
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import pdimport os
-import glob
-from PIL import Image
 from skimage.measure import label
 import sys
 import math
-from numbers import Number
-from multiprocessing import cpu_count
-from torch.nn.functional import adaptive_avg_pool2d
-import pathlib
-from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
-import torchvision.transforms as TF
-from PIL import Image
-from scipy import linalg
-from torch.autograd import Variable
-import torchvision
 import torch.optim as optim
 import torch.utils.data
 import torchvision.datasets as dset
-import warnings
-import torchvision.models as models
-#from tqdm import tqdm_notebook as tqdm
-import time
-from torch.utils.tensorboard import SummaryWriter
-
 from models.models import Generator, Discriminator
-from fid.fid import FID, fid_obj
-from diffAug.diffAug import DiffAugment, rand_brightness, rand_saturation, rand_contrast, rand_translation, rand_cutout, AUGMENT_FNS
+from fid.fid import fid_obj
+from diffAug.diffAug import DiffAugment
 from bay.bay import NoiseLoss, PriorLoss
 from utils.utils import weights_init
 
@@ -69,6 +43,10 @@ parser.add_argument("--aug_prob", type=float, default=1.0, help="probability of 
 parser.add_argument('--bayes', type=int, default=1, help='Do Bayesian GAN or normal GAN')
 parser.add_argument('--gnoise_alpha', type=float, default=0.0001, help='')
 parser.add_argument('--dnoise_alpha', type=float, default=0.0001, help='')
+
+parser.add_argument('--numz', type=int, default=1, help='The number of set of z to marginalize over.')
+parser.add_argument('--num_mcmc', type=int, default=10, help='The number of MCMC chains to run in parallel')
+parser.add_argument('--num_semi', type=int, default=4000, help='The number of semi-supervised samples')
 
 print("==============")
 opt, args = parser.parse_known_args(sys.argv[1:])
@@ -111,6 +89,11 @@ plt.show()
 netG = Generator(opt).to(device)
 netG_no_diff = Generator(opt).to(device)
 netG_bay = Generator(opt).to(device)
+netGs = []
+for idxz in range(opt.numz):
+    for idxm in range(opt.num_mcmc):
+        netG_mcmc = Generator(opt).to(device)
+        netGs.append(netG_mcmc)
 
 # Handle multi-gpu if desired
 if (device.type == 'cuda') and (ngpu > 1):
@@ -118,31 +101,40 @@ if (device.type == 'cuda') and (ngpu > 1):
     netG = nn.DataParallel(netG, list(range(ngpu)))
     netG_no_diff = nn.DataParallel(netG_no_diff, list(range(ngpu)))
     netG_bay = nn.DataParallel(netG_bay, list(range(ngpu)))
-# Apply the weights_init function to randomly initialize all weights to mean=0, stdev=0.2.
+
+    for idxz in range(opt.numz):
+        for idxm in range(opt.num_mcmc):
+            idx = idxz*opt.num_mcmc + idxm
+            netGs[idx] = nn.DataParallel(netGs[idx], list(range(ngpu)))
+
+# Apply the weights_init 
 netG.apply(weights_init)
 netG_no_diff.apply(weights_init)
 netG_bay.apply(weights_init)
 
-# Print the G
-
+for idxz in range(opt.numz):
+    for idxm in range(opt.num_mcmc):
+        idx = idxz*opt.num_mcmc + idxm
+        netGs[idx].apply(weights_init)
+#running parallel 10 chains of mcmc
 
 netD = Discriminator(opt).to(device)
 netD_no_diff = Discriminator(opt).to(device)
 netD_bay = Discriminator(opt).to(device)
+netD_mcmc = Discriminator(opt).to(device)
 
 # Handle multi-gpu if desired
 if (device.type == 'cuda') and (ngpu > 1):
     netD = nn.DataParallel(netD, list(range(ngpu)))
     netD_no_diff = nn.DataParallel(netD_no_diff, list(range(ngpu)))
     netD_bay = nn.DataParallel(netD_bay, list(range(ngpu)))
-    
-# Apply the weights_init function to randomly initialize all weights to mean=0, stdev=0.2.
+    netD_mcmc = nn.DataParallel(netD_mcmc, list(range(ngpu)))
+
+# Apply the weights_init function 
 netD.apply(weights_init)
 netD_no_diff.apply(weights_init)
 netD_bay.apply(weights_init)
-
-# Print the model
-
+netD_mcmc.apply(weights_init)
 
 # Initialize BCELoss function
 criterion = nn.BCELoss()
@@ -162,7 +154,12 @@ optimizerG_no_diff = optim.Adam(netG_no_diff.parameters(), lr = opt.lr, betas = 
 optimizerD_bay = optim.Adam(netD_bay.parameters(), lr = opt.lr, betas = (opt.b1, opt.b2))
 optimizerG_bay = optim.Adam(netG_bay.parameters(), lr = opt.lr, betas = (opt.b1, opt.b2))
 
-# Training Loop
+optimizerGs = []
+for index in range(len(netGs)):
+    optimizerG_mcmc = optim.Adam(netGs[index].parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+    optimizerGs.append(optimizerG_mcmc)
+
+optimizerD_mcmc = optim.Adam(netD_mcmc.parameters(), lr = opt.lr, betas = (opt.b1, opt.b2))
 
 # Lists to keep track of progress
 img_list = []
@@ -189,6 +186,7 @@ gnoise_criterion = NoiseLoss(params=netG.parameters(), scale=math.sqrt(2*opt.gno
 dprior_criterion = PriorLoss(prior_std=1., observed=50000.)
 dnoise_criterion = NoiseLoss(params=netD.parameters(), scale=math.sqrt(2*opt.dnoise_alpha*opt.lr), observed=50000.)
 
+
 print("Starting Training Loop...")
 # For each epoch
 for epoch in range(opt.num_epochs):
@@ -196,18 +194,18 @@ for epoch in range(opt.num_epochs):
     for i, data in enumerate(dataloader, 0):
         rand_prob = np.random.uniform(0, 1)
 
-        ############################
         # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-        ###########################
-        ## Train with all-real batch
+        
         netD.zero_grad()
         netD_no_diff.zero_grad()
         netD_bay.zero_grad()
+        netD_mcmc.zero_grad()
 
         # Format batch
         real_cpu = data[0].to(device)
         real_cpu_no_diff = data[0].to(device)
         real_cpu_bay = data[0].to(device)
+        real_cpu_mcmc = data[0].to(device)
 
         if rand_prob < opt.aug_prob:
             real_cpu = DiffAugment(real_cpu, policy='color,translation,cutout')
@@ -221,46 +219,56 @@ for epoch in range(opt.num_epochs):
         b_size = real_cpu.size(0)
         b_size_no_diff = real_cpu_no_diff.size(0)
         b_size_bay = real_cpu_bay.size(0)
+        b_size_mcmc = real_cpu_mcmc.size(0)
 
         label = torch.full((b_size,), real_label, device=device)
         label_no_diff = torch.full((b_size_no_diff,), real_label, device=device)
         label_bay = torch.full((b_size_bay,), real_label, device=device)
+        label_mcmc = torch.full((b_size_mcmc,), real_label, device=device)
 
         # Forward pass real batch through D
         output = netD(real_cpu).view(-1)
         output_no_diff = netD_no_diff(real_cpu_no_diff).view(-1)
         output_bay = netD_bay(real_cpu_bay).view(-1)
+        output_mcmc = netD_mcmc(real_cpu_mcmc).view(-1)
 
         # Calculate loss on all-real batch
         label = label.to(dtype=torch.float)
         label_no_diff = label_no_diff.to(dtype=torch.float)
         label_bay = label_bay.to(dtype=torch.float)
-        
+        label_mcmc = label_mcmc.to(dtype=torch.float)
+
         #label = torch.full((b_size,), label, device=device, dtype=torch.float)
         errD_real = criterion(output, label)
         errD_real_no_diff = criterion(output_no_diff, label_no_diff)
         errD_real_bay = criterion(output_bay, label_bay)
+        errD_real_mcmc = criterion(output_mcmc, label_mcmc)
 
         # Calculate gradients for D in backward pass
         errD_real.backward()
         errD_real_no_diff.backward()
         errD_real_bay.backward()
+        errD_real_mcmc.backward()
 
         D_x = output.mean().item()
         D_x_no_diff = output_no_diff.mean().item()
         D_x_bay = output_bay.mean().item()
+        D_x_mcmc = output_mcmc.mean().item()
 
         ## Train with all-fake batch
         # Generate batch of latent vectors
         noise = torch.randn(b_size, opt.nz, 1, 1, device=device)
         noise_no_diff = torch.randn(b_size_no_diff, opt.nz, 1, 1, device=device)
         noise_bay = torch.randn(b_size_bay, opt.nz, 1, 1, device=device)
-        
+        noise_mcmc = torch.randn(b_size_mcmc, opt.nz, 1,1, device=device)
+
         # Generate fake image batch with G
         fake = netG(noise)
         fake_no_diff = netG_no_diff(noise_no_diff)
         fake_bay = netG_bay(noise_bay)
-
+        fakes = []
+        
+        # for samples with mcmc we do not apply diff augment 
         if rand_prob < opt.aug_prob:
             fake = DiffAugment(fake, policy='color,translation,cutout')
             fake_bay = DiffAugment(fake_bay, policy='color,translation,cutout')
@@ -271,85 +279,121 @@ for epoch in range(opt.num_epochs):
             #plt.imshow(np.transpose(fake_aug[0].cpu().detach().numpy(), axes=[1, 2, 0]))
             #plt.show()
         
+        for idxz in range(opt.numz):
+            for idxm in range(opt.num_mcmc):
+                idx = idxz * opt.num_mcmc + idxm
+                netG_temp = netGs[idx] 
+                fake_temp = netG_temp(noise_mcmc)
+                fakes.append(fake_temp)
+        
+        fakes_mcmc = torch.cat(fakes_mcmc)
+
         label.fill_(fake_label)
         label_no_diff.fill_(fake_label)
         label_bay.fill_(fake_label)
+        label_mcmc.fill_(fake_label) 
 
         # Classify all fake batch with D
         output = netD(fake.detach()).view(-1)
         output_no_diff = netD_no_diff(fake_no_diff.detach()).view(-1)
         output_bay = netD_bay(fake_bay.detach()).view(-1)
+        output_mcmc = netD_mcmc(fakes_mcmc.detach()).view(-1)
 
         # Calculate D's loss on the all-fake batch
         errD_fake = criterion(output, label)
         errD_fake_no_diff = criterion(output_no_diff, label_no_diff)
         errD_fake_bay = criterion(output_bay, label_bay)
+        errD_fake_mcmc = criterion(output_mcmc, label_mcmc)
 
         # Calculate the gradients for this batch
         errD_fake.backward()
         errD_fake_no_diff.backward()
         errD_fake_bay.backward()
+        errD_fake_mcmc.backward()
 
         D_G_z1 = output.mean().item()
         D_G_z1_no_diff = output_no_diff.mean().item()
         D_G_z1_bay = output_bay.mean().item()
+        D_G_z1_mcmc = output_mcmc.mean().item()
 
         # Add the gradients from the all-real and all-fake batches
         errD = errD_real + errD_fake
         errD_no_diff = errD_real_no_diff + errD_fake_no_diff
         errD_bay = errD_real_bay + errD_fake_bay
+        errD_mcmc = errD_real_mcmc + errD_fake_mcmc
 
         if opt.bayes:
             errD_prior = dprior_criterion(netD_bay.parameters())
             errD_prior.backward()
             errD_noise = dnoise_criterion(netD_bay.parameters())
             errD_noise.backward()
-            errD_bay += errD_prior 
-            errD_bay += errD_noise
-            
+            errD_bay = errD_bay + errD_prior + errD_noise 
+
+            errD_prior_mcmc = dprior_criterion(netD_mcmc.parameters())
+            errD_prior_mcmc.backward()
+            errD_noise_mcmc = dnoise_criterion(netD_mcmc.parameters())
+            errD_noise_mcmc.backward()
+            errD_mcmc = errD_mcmc + errD_prior + errD_noise
         # Update D
         optimizerD.step()
         optimizerD_no_diff.step()
         optimizerD_bay.step()
-
+        optimizerD_mcmc.step()
         ############################
         # (2) Update G network: maximize log(D(G(z)))
         ###########################
         netG.zero_grad()
         netG_no_diff.zero_grad()
         netG_bay.zero_grad()
-
+        for idxz in range(len(opt.numz)):
+            for idxm in range(len(opt.num_mcmc)):
+                idx = idxz * opt.num_mcmc + idxm
+                netGs[idx].zero_grad()
+    
         label.fill_(real_label)  # fake labels are real for generator cost
         label_no_diff.fill_(real_label)
         label_bay.fill_(real_label)
+        label_mcmc.fill_(real_label)
 
         # Since we just updated D, perform another forward pass of all-fake batch through D
         output = netD(fake).view(-1)
         output_no_diff = netD_no_diff(fake_no_diff).view(-1)
         output_bay = netD_bay(fake_bay).view(-1)
+        output_mcmc = netD_mcmc(fakes_mcmc).view(-1)
 
         # Calculate G's loss based on this output
         errG = criterion(output, label)
         errG_no_diff = criterion(output_no_diff, label_no_diff)
         errG_bay = criterion(output_bay, label_bay)
+        errG_mcmc = criterion(output_mcmc, label_mcmc)
 
         if opt.bayes:
            errG_bay += gprior_criterion(netG_bay.parameters())
            errG_bay += gnoise_criterion(netG_bay.parameters())
 
+           for netG_mcmc_temp in netGs:
+               errG_mcmc += gprior_criterion(netG_mcmc_temp.parameters()) 
+               errG_mcmc += gnoise_criterion(netG_mcmc_temp.parameters())
+
         # Calculate gradients for G
         errG.backward()
         errG_no_diff.backward()
         errG_bay.backward()
+        errG_mcmc.backward()
 
         D_G_z2 = output.mean().item()
         D_G_z2_no_diff = output_no_diff.mean().item()
         D_G_z2_bay = output_bay.mean().item()
+        D_G_z2_mcmc = output_mcmc.mean().item()
 
         # Update G
         optimizerG.step()
         optimizerG_no_diff.step()
         optimizerG_bay.step()
+        for idxz in range(len(opt.numz)):
+            for idxm in range(len(opt.num_mcmc)):
+                idx = idxz * opt.num_mcmc + idxm
+                optimizerGs[idx].step()
 
         # Output training stats
         if i % 20 == 0:
